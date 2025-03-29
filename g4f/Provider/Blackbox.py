@@ -16,9 +16,9 @@ from ..requests.raise_for_status import raise_for_status
 from .base_provider import AsyncGeneratorProvider, ProviderModelMixin
 from ..image import to_data_uri
 from ..cookies import get_cookies_dir
-from .helper import format_prompt, format_image_prompt
+from .helper import format_image_prompt
 from ..providers.response import JsonConversation, ImageResponse
-from ..errors import ModelNotSupportedError
+from ..tools.media import merge_media
 from .. import debug
 
 class Conversation(JsonConversation):
@@ -46,6 +46,7 @@ class Blackbox(AsyncGeneratorProvider, ProviderModelMixin):
     # Completely free models
     fallback_models = [
         "blackboxai", 
+        "blackboxai-pro",
         "gpt-4o-mini", 
         "GPT-4o", 
         "o1", 
@@ -111,6 +112,7 @@ class Blackbox(AsyncGeneratorProvider, ProviderModelMixin):
 
     # Trending agent modes
     trendingAgentMode = {
+        'blackboxai-pro': {'mode': True, 'id': "BLACKBOXAI-PRO"},
         "Gemini Agent": {'mode': True, 'id': 'gemini'},
         "llama-3.1-405 Agent": {'mode': True, 'id': "llama-3.1-405"},
         'llama-3.1-70b Agent': {'mode': True, 'id': "llama-3.1-70b"},
@@ -486,7 +488,7 @@ class Blackbox(AsyncGeneratorProvider, ProviderModelMixin):
                             "filePath": f"/{image_name}",
                             "contents": to_data_uri(image)
                         }
-                        for image, image_name in media
+                        for image, image_name in merge_media(media, messages)
                     ],
                     "fileText": "",
                     "title": ""
