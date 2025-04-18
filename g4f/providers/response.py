@@ -240,6 +240,15 @@ class Sources(ResponseType):
             for idx, link in enumerate(self.list)
         ]))
 
+class SourceLink(ResponseType):
+    def __init__(self, title: str, url: str) -> None:
+        self.title = title
+        self.url = url
+
+    def __str__(self) -> str:
+        title = f"[{self.title}]"
+        return f" {format_link(self.url, title)}"
+
 class YouTube(HiddenResponse):
     def __init__(self, ids: List[str]) -> None:
         """Initialize with a list of YouTube IDs."""
@@ -284,6 +293,10 @@ class SynthesizeData(HiddenResponse, JsonMixin):
         self.provider = provider
         self.data = data
 
+class SuggestedFollowups(HiddenResponse):
+    def __init__(self, suggestions: list[str]):
+        self.suggestions = suggestions
+
 class RequestLogin(HiddenResponse):
     def __init__(self, label: str, login_url: str) -> None:
         """Initialize with label and login URL."""
@@ -297,12 +310,13 @@ class RequestLogin(HiddenResponse):
 class MediaResponse(ResponseType):
     def __init__(
         self,
-        images: Union[str, List[str]],
+        urls: Union[str, List[str]],
         alt: str,
-        options: Dict = {}
+        options: Dict = {},
+        **kwargs
     ) -> None:
         """Initialize with images, alt text, and options."""
-        self.images = images
+        self.urls = kwargs.get("images", urls)
         self.alt = alt
         self.options = options
 
@@ -312,12 +326,12 @@ class MediaResponse(ResponseType):
 
     def get_list(self) -> List[str]:
         """Return images as a list."""
-        return [self.images] if isinstance(self.images, str) else self.images
+        return [self.urls] if isinstance(self.urls, str) else self.urls
 
 class ImageResponse(MediaResponse):
     def __str__(self) -> str:
         """Return images as markdown."""
-        return format_images_markdown(self.images, self.alt, self.get("preview"))
+        return format_images_markdown(self.urls, self.alt, self.get("preview"))
 
 class VideoResponse(MediaResponse):
     def __str__(self) -> str:

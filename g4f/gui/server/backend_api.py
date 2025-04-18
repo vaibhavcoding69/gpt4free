@@ -18,6 +18,7 @@ from hashlib import sha256
 
 from ...client.service import convert_to_provider
 from ...providers.asyncio import to_sync_generator
+from ...providers.response import FinishReason
 from ...client.helper import filter_markdown
 from ...tools.files import supports_filename, get_streaming, get_bucket_dir, get_buckets
 from ...tools.run_tools import iter_run_tools
@@ -79,16 +80,12 @@ class Backend_Api(Api):
         @app.route('/backend-api/v2/models', methods=['GET'])
         def jsonify_models(**kwargs):
             response = get_demo_models() if app.demo else self.get_models(**kwargs)
-            if isinstance(response, list):
-                return jsonify(response)
-            return response
+            return jsonify(response)
 
         @app.route('/backend-api/v2/models/<provider>', methods=['GET'])
         def jsonify_provider_models(**kwargs):
             response = self.get_provider_models(**kwargs)
-            if isinstance(response, list):
-                return jsonify(response)
-            return response
+            return jsonify(response)
 
         @app.route('/backend-api/v2/providers', methods=['GET'])
         def jsonify_providers(**kwargs):
@@ -102,6 +99,8 @@ class Backend_Api(Api):
                 "name": model.name,
                 "image": isinstance(model, models.ImageModel),
                 "vision": isinstance(model, models.VisionModel),
+                "audio": isinstance(model, models.AudioModel),
+                "video": isinstance(model, models.VideoModel),
                 "providers": [
                     getattr(provider, "parent", provider.__name__)
                     for provider in providers
@@ -259,9 +258,11 @@ class Backend_Api(Api):
                     else:
                         response = iter_run_tools(ChatCompletion.create, **parameters)
                         cache_dir.mkdir(parents=True, exist_ok=True)
+                        copy_response = [chunk for chunk in response]
                         with cache_file.open("w") as f:
-                            for chunk in response:
+                            for chunk in copy_response:
                                 f.write(str(chunk))
+                        response = copy_response
                 else:
                     response = iter_run_tools(ChatCompletion.create, **parameters)
 
@@ -269,23 +270,14 @@ class Backend_Api(Api):
                     return Response(filter_markdown("".join([str(chunk) for chunk in response]), do_filter_markdown), mimetype='text/plain')
                 def cast_str():
                     for chunk in response:
-                        if not isinstance(chunk, Exception):
+                        if isinstance(chunk, FinishReason):
+                            yield f"[{chunk.reason}]" if chunk.reason != "stop" else ""
+                        elif not isinstance(chunk, Exception):
                             yield str(chunk)
                 return Response(cast_str(), mimetype='text/plain')
             except Exception as e:
                 logger.exception(e)
                 return jsonify({"error": {"message": f"{type(e).__name__}: {e}"}}), 500
-
-        @app.route('/backend-api/v2/buckets', methods=['GET'])
-        def list_buckets():
-            try:
-                buckets = get_buckets()
-                if buckets is None:
-                    return jsonify({"error": {"message": "Error accessing bucket directory"}}), 500
-                sanitized_buckets = [secure_filename(b) for b in buckets]
-                return jsonify(sanitized_buckets), 200
-            except Exception as e:
-                return jsonify({"error": {"message": str(e)}}), 500
 
         @app.route('/backend-api/v2/files/<bucket_id>', methods=['GET', 'DELETE'])
         def manage_files(bucket_id: str):
@@ -349,28 +341,35 @@ class Backend_Api(Api):
                     return redirect(source_url)
                 raise
 
+        self.match_files = {}
+
         @app.route('/search/<search>', methods=['GET'])
         def find_media(search: str):
-            search = [secure_filename(chunk.lower()) for chunk in search.split("+")]
+            safe_search = [secure_filename(chunk.lower()) for chunk in search.split("+")]
             if not os.access(images_dir, os.R_OK):
                 return jsonify({"error": {"message": "Not found"}}), 404
-            match_files = {}
-            for root, _, files in os.walk(images_dir):
-                for file in files:
-                    mime_type = is_allowed_extension(file)
-                    if mime_type is not None:
-                        mime_type = secure_filename(mime_type)
-                        for tag in search:
-                            if tag in mime_type:
-                                match_files[file] = match_files.get(file, 0) + 1
-                                break
-                    for tag in search:
-                        if tag in file.lower():
-                            match_files[file] = match_files.get(file, 0) + 1
-            match_files = [file for file, count in match_files.items() if count >= request.args.get("min", len(search))]
+            if search not in self.match_files:
+                self.match_files[search] = {}
+                for root, _, files in os.walk(images_dir):
+                    for file in files:
+                        mime_type = is_allowed_extension(file)
+                        if mime_type is not None:
+                            mime_type = secure_filename(mime_type)
+                            for tag in safe_search:
+                                if tag in mime_type:
+                                    self.match_files[search][file] = self.match_files[search].get(file, 0) + 1
+                                    break
+                        for tag in safe_search:
+                            if tag in file.lower():
+                                self.match_files[search][file] = self.match_files[search].get(file, 0) + 1
+                    break
+            match_files = [file for file, count in self.match_files[search].items() if count >= request.args.get("min", len(safe_search))]
             if int(request.args.get("skip", 0)) >= len(match_files):
                 return jsonify({"error": {"message": "Not found"}}), 404
             if (request.args.get("random", False)):
+                seed = request.args.get("random")
+                if seed not in ["true", "True", "1"]:
+                   random.seed(seed)
                 return redirect(f"/media/{random.choice(match_files)}"), 302
             return redirect(f"/media/{match_files[int(request.args.get('skip', 0))]}", 302)
 
@@ -439,7 +438,8 @@ class Backend_Api(Api):
     def get_provider_models(self, provider: str):
         api_key = request.headers.get("x_api_key")
         api_base = request.headers.get("x_api_base")
-        models = super().get_provider_models(provider, api_key, api_base)
+        ignored = request.headers.get("x_ignored").split()
+        models = super().get_provider_models(provider, api_key, api_base, ignored)
         if models is None:
             return "Provider not found", 404
         return models

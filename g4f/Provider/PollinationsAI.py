@@ -12,7 +12,7 @@ from .helper import filter_none, format_image_prompt
 from .base_provider import AsyncGeneratorProvider, ProviderModelMixin
 from ..typing import AsyncResult, Messages, MediaListType
 from ..image import is_data_an_audio
-from ..errors import ModelNotFoundError
+from ..errors import ModelNotFoundError, ResponseError
 from ..requests.raise_for_status import raise_for_status
 from ..requests.aiohttp import get_connector
 from ..image.copy_images import save_response_media
@@ -46,29 +46,30 @@ class PollinationsAI(AsyncGeneratorProvider, ProviderModelMixin):
     default_model = "openai"
     default_image_model = "flux"
     default_vision_model = default_model
-    text_models = [default_model]
+    default_audio_model = "openai-audio"
+    text_models = [default_model, "evil"]
     image_models = [default_image_model]
-    extra_image_models = ["flux-pro", "flux-dev", "flux-schnell", "midjourney", "dall-e-3"]
-    vision_models = [default_vision_model, "gpt-4o-mini", "o3-mini", "openai", "openai-large"]
-    extra_text_models = vision_models
+    audio_models = {default_audio_model: []}
+    extra_image_models = ["flux-pro", "flux-dev", "flux-schnell", "midjourney", "dall-e-3", "turbo"]
+    vision_models = [default_vision_model, "gpt-4o-mini", "openai", "openai-large", "searchgpt"]
     _models_loaded = False
+    # https://github.com/pollinations/pollinations/blob/master/text.pollinations.ai/generateTextPortkey.js#L15
     model_aliases = {
         ### Text Models ###
         "gpt-4o-mini": "openai",
         "gpt-4": "openai-large",
         "gpt-4o": "openai-large",
-        "o3-mini": "openai-reasoning",
         "qwen-2.5-coder-32b": "qwen-coder",
         "llama-3.3-70b": "llama",
+        "llama-4-scout": "llamascout",
         "mistral-nemo": "mistral",
-        "gpt-4o-mini": "searchgpt",
         "llama-3.1-8b": "llamalight",
         "llama-3.3-70b": "llama-scaleway",
         "phi-4": "phi",
-        "gemini-2.0": "gemini",
-        "gemini-2.0-flash": "gemini",
-        "gemini-2.0-flash-thinking": "gemini-thinking",
-        "deepseek-r1": "deepseek-r1-llama",
+        "deepseek-r1": "deepseek-reasoning-large",
+        "deepseek-r1": "deepseek-reasoning",
+        "deepseek-v3": "deepseek",
+        "llama-3.2-11b": "llama-vision",
         "gpt-4o-audio": "openai-audio",
         
         ### Image Models ###
@@ -86,40 +87,42 @@ class PollinationsAI(AsyncGeneratorProvider, ProviderModelMixin):
                 else:
                     new_image_models = []
 
-                # Combine models without duplicates
-                all_image_models = (
-                    cls.image_models +  # Already contains the default
-                    cls.extra_image_models + 
-                    new_image_models
-                )
-                cls.image_models = list(dict.fromkeys(all_image_models))
+                # Combine image models without duplicates
+                all_image_models = [cls.default_image_model]  # Start with default model
+                
+                # Add extra image models if not already in the list
+                for model in cls.extra_image_models + new_image_models:
+                    if model not in all_image_models:
+                        all_image_models.append(model)
+                
+                cls.image_models = all_image_models
 
-                # Update of text models
                 text_response = requests.get("https://text.pollinations.ai/models")
                 text_response.raise_for_status()
                 models = text_response.json()
-                original_text_models = [
-                    model.get("name") 
-                    for model in models
-                    if model.get("type") == "chat"
-                ]
+
+                # Purpose of audio models
                 cls.audio_models = {
                     model.get("name"): model.get("voices")
                     for model in models
-                    if model.get("audio")
+                    if "output_modalities" in model and "audio" in model["output_modalities"]
                 }
-                
-                # Combining text models
-                combined_text = (
-                    cls.text_models +  # Already contains the default
-                    cls.extra_text_models + 
-                    [
-                        model for model in original_text_models
-                        if model not in cls.extra_text_models
-                    ]
-                )
-                cls.text_models = list(dict.fromkeys(combined_text))
-                
+
+                # Create a set of unique text models starting with default model
+                unique_text_models = cls.text_models.copy()
+
+                # Add models from vision_models
+                unique_text_models.extend(cls.vision_models)
+
+                # Add models from the API response
+                for model in models:
+                    model_name = model.get("name")
+                    if model_name and "input_modalities" in model and "text" in model["input_modalities"]:
+                        unique_text_models.append(model_name)
+
+                # Convert to list and update text_models
+                cls.text_models = list(dict.fromkeys(unique_text_models))
+
                 cls._models_loaded = True
 
             except Exception as e:
@@ -130,7 +133,11 @@ class PollinationsAI(AsyncGeneratorProvider, ProviderModelMixin):
                     cls.image_models = [cls.default_image_model]
                 debug.error(f"Failed to fetch models: {e}")
 
-        return cls.text_models + cls.image_models
+        # Return unique models across all categories
+        all_models = cls.text_models.copy()
+        all_models.extend(cls.image_models)
+        all_models.extend(cls.audio_models.keys())
+        return list(dict.fromkeys(all_models))
 
     @classmethod
     async def create_async_generator(
@@ -155,7 +162,7 @@ class PollinationsAI(AsyncGeneratorProvider, ProviderModelMixin):
         media: MediaListType = None,
         temperature: float = None,
         presence_penalty: float = None,
-        top_p: float = 1,
+        top_p: float = None,
         frequency_penalty: float = None,
         response_format: Optional[dict] = None,
         extra_parameters: list[str] = ["tools", "parallel_tool_calls", "tool_choice", "reasoning_effort", "logit_bias", "voice", "modalities", "audio"],
@@ -242,15 +249,15 @@ class PollinationsAI(AsyncGeneratorProvider, ProviderModelMixin):
         query = "&".join(f"{k}={quote_plus(str(v))}" for k, v in params.items() if v is not None)
         prompt = quote_plus(prompt)[:2048-256-len(query)]
         url = f"{cls.image_api_endpoint}prompt/{prompt}?{query}"
-        def get_image_url(i: int = 0, seed: Optional[int] = None):
-            if i == 0:
+        def get_image_url(i: int, seed: Optional[int] = None):
+            if i == 1:
                 if not cache and seed is None:
                     seed = random.randint(0, 2**32)
             else:
                 seed = random.randint(0, 2**32)
             return f"{url}&seed={seed}" if seed else url
         async with ClientSession(headers=DEFAULT_HEADERS, connector=get_connector(proxy=proxy)) as session:
-            async def get_image(i: int = 0, seed: Optional[int] = None):
+            async def get_image(i: int, seed: Optional[int] = None):
                 async with session.get(get_image_url(i, seed), allow_redirects=False) as response:
                     try:
                         await raise_for_status(response)
@@ -281,7 +288,7 @@ class PollinationsAI(AsyncGeneratorProvider, ProviderModelMixin):
         **kwargs
     ) -> AsyncResult:
         if not cache and seed is None:
-            seed = random.randint(9999, 99999999)
+            seed = random.randint(0, 2**32)
         json_mode = False
         if response_format and response_format.get("type") == "json_object":
             json_mode = True
@@ -320,31 +327,32 @@ class PollinationsAI(AsyncGeneratorProvider, ProviderModelMixin):
                             if line[6:].startswith(b"[DONE]"):
                                 break
                             result = json.loads(line[6:])
+                            if "error" in result:
+                                raise ResponseError(result["error"].get("message", result["error"]))
+                            if result.get("usage") is not None:
+                                yield Usage(**result["usage"])
                             choices = result.get("choices", [{}])
                             choice = choices.pop() if choices else {}
                             content = choice.get("delta", {}).get("content")
                             if content:
                                 yield content
-                            if "usage" in result:
-                                yield Usage(**result["usage"])
                             finish_reason = choice.get("finish_reason")
                             if finish_reason:
                                 yield FinishReason(finish_reason)
                     return
                 result = await response.json()
-                choice = result["choices"][0]
-                message = choice.get("message", {})
-                content = message.get("content", "")
-
-                if "tool_calls" in message:
-                    yield ToolCalls(message["tool_calls"])
-
-                if content:
-                    yield content
-
-                if "usage" in result:
+                if "choices" in result:
+                    choice = result["choices"][0]
+                    message = choice.get("message", {})
+                    content = message.get("content", "")
+                    if content:
+                        yield content
+                    if "tool_calls" in message:
+                        yield ToolCalls(message["tool_calls"])
+                else:
+                    raise ResponseError(result)
+                if result.get("usage") is not None:
                     yield Usage(**result["usage"])
-
                 finish_reason = choice.get("finish_reason")
                 if finish_reason:
                     yield FinishReason(finish_reason)
