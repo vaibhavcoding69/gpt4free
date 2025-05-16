@@ -21,3 +21,4 @@ python-multipart
 pypdf2
 python-docx
 markitdown[all]
+g4f
